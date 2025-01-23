@@ -19,12 +19,10 @@ import (
 	"github.com/wmnsk/go-pfcp/ie"
 )
 
-type UpfPath []netip.Addr
-
 type Smf struct {
 	upfs    *UpfsMap
 	slices  *SlicesMap
-	areas   AreasMap
+	Areas   AreasMap
 	srv     *pfcp.PFCPEntityCP
 	started bool
 	closed  chan struct{}
@@ -40,7 +38,7 @@ func NewSmf(addr netip.Addr, slices map[string]config.Slice, areas map[string]co
 		srv:    pfcp.NewPFCPEntityCP(addr.String(), addr),
 		slices: s,
 		upfs:   upfs,
-		areas:  NewAreasMap(areas),
+		Areas:  NewAreasMap(areas),
 		closed: make(chan struct{}),
 		ctx:    nil,
 	}
@@ -139,7 +137,7 @@ func (smf *Smf) CreateSessionDownlinkContext(ctx context.Context, ueCtrl jsonapi
 	}
 	last_fteid := session.DownlinkFteid
 
-	area, ok := smf.areas.Area(gnbCtrl)
+	area, ok := smf.Areas.Area(gnbCtrl)
 	if !ok {
 		return nil, ErrAreaNotFound
 	}
@@ -171,6 +169,66 @@ func (smf *Smf) CreateSessionDownlinkContext(ctx context.Context, ueCtrl jsonapi
 		}
 	}
 	return session, nil
+}
+
+func (smf *Smf) CreateSessionDownlinkFWUpfIContext(ctx context.Context, ueCtrl jsonapi.ControlURI, ueIp netip.Addr, dnn string, fwUpfi *config.GTPInterface, DlFteid jsonapi.Fteid) (*jsonapi.Fteid, error) {
+	if !smf.started {
+		return nil, ErrSmfNotStarted
+	}
+	if ctx == nil {
+		return nil, ErrNilCtx
+	}
+	select {
+	case <-ctx.Done():
+		// if ctx is over, abort
+		return nil, ctx.Err()
+	case <-smf.ctx.Done():
+		// if smf.ctx is over, abort
+		return nil, smf.ctx.Err()
+	default:
+	}
+
+	upf_any, ok := smf.upfs.Load(fwUpfi.NodeID)
+	if !ok {
+		return nil, ErrUpfNotFound
+	}
+	upf := upf_any.(*Upf)
+
+	fteid, _, err := upf.UpdateDownlinkIntermediateContext(ctx, ueIp, dnn, fwUpfi.InterfaceAddr, &DlFteid)
+	if err != nil {
+		return nil, err
+	}
+	if err := upf.UpdateSession(ueIp); err != nil {
+		return nil, err
+	}
+	return fteid, nil
+}
+
+func (smf *Smf) SessionFirstUpf(ueCtrl jsonapi.ControlURI, ueIp netip.Addr, dnn string, gnbCtrl jsonapi.ControlURI) (*config.GTPInterface, error) {
+	s, ok := smf.slices.Load(dnn)
+	if !ok {
+		return nil, ErrDnnNotFound
+	}
+	slice := s.(*Slice)
+	if len(slice.Upfs) == 0 {
+		return nil, ErrUpfNotFound
+	}
+
+	area, ok := smf.Areas.Area(gnbCtrl)
+	if !ok {
+		return nil, ErrAreaNotFound
+	}
+
+	path, ok := slice.Paths[area]
+	if !ok {
+		return nil, ErrPathNotFound
+	}
+
+	if len(path) == 0 {
+		return nil, ErrUpfNotFound
+	}
+	return &path[0], nil
+
 }
 
 func (smf *Smf) CreateSessionUplink(ueCtrl jsonapi.ControlURI, gnbCtrl jsonapi.ControlURI, dnn string) (*PduSessionN3, error) {
@@ -206,7 +264,7 @@ func (smf *Smf) CreateSessionUplinkContext(ctx context.Context, ueCtrl jsonapi.C
 	}
 	// create new session
 	// 1. check path
-	area, ok := smf.areas.Area(gnbCtrl)
+	area, ok := smf.Areas.Area(gnbCtrl)
 	if !ok {
 		return nil, ErrAreaNotFound
 	}
@@ -253,13 +311,21 @@ func (smf *Smf) CreateSessionUplinkContext(ctx context.Context, ueCtrl jsonapi.C
 		}
 	}
 
-	session := PduSessionN3{
-		UeIpAddr:    ueIpAddr,
-		UplinkFteid: last_fteid,
+	session, err := slice.sessions.Get(ueCtrl, ueIpAddr)
+	if err != nil {
+		// store session
+		session = &PduSessionN3{
+			UeIpAddr:    ueIpAddr,
+			UplinkFteid: last_fteid,
+		}
+		slice.sessions.Add(ueCtrl, session)
+	} else {
+		// update session
+		if err := slice.sessions.SetUplinkFteid(ueCtrl, ueIpAddr, last_fteid); err != nil {
+			return nil, err
+		}
 	}
-	// store session
-	slice.sessions.Add(ueCtrl, &session)
-	return &session, nil
+	return session, nil
 }
 
 func (smf *Smf) WaitShutdown(ctx context.Context) error {
@@ -283,6 +349,22 @@ func (smf *Smf) GetSessionUplinkFteid(ueCtrl jsonapi.ControlURI, ueAddr netip.Ad
 	return session.UplinkFteid, nil
 }
 
+func (smf *Smf) SetSessionIndirectForwardingRequired(ueCtrl jsonapi.ControlURI, ueAddr netip.Addr, dnn string, value bool) error {
+	slice, ok := smf.slices.Load(dnn)
+	if !ok {
+		return ErrDnnNotFound
+	}
+	return slice.(*Slice).sessions.SetIndirectForwardingRequired(ueCtrl, ueAddr, value)
+}
+
+func (smf *Smf) GetSessionIndirectForwardingRequired(ueCtrl jsonapi.ControlURI, ueAddr netip.Addr, dnn string) (bool, error) {
+	slice, ok := smf.slices.Load(dnn)
+	if !ok {
+		return false, ErrDnnNotFound
+	}
+	return slice.(*Slice).sessions.GetIndirectForwardingRequired(ueCtrl, ueAddr)
+}
+
 func (smf *Smf) GetSessionDownlinkFteid(ueCtrl jsonapi.ControlURI, ueAddr netip.Addr, dnn string) (*jsonapi.Fteid, error) {
 	slice, ok := smf.slices.Load(dnn)
 	if !ok {
@@ -303,6 +385,14 @@ func (smf *Smf) StoreNextDownlinkFteid(ueCtrl jsonapi.ControlURI, ueAddr netip.A
 	return slice.(*Slice).sessions.SetNextDownlinkFteid(ueCtrl, ueAddr, fteid)
 }
 
+func (smf *Smf) GetNextDownlinkFteid(ueCtrl jsonapi.ControlURI, ueAddr netip.Addr, dnn string) (*jsonapi.Fteid, error) {
+	slice, ok := smf.slices.Load(dnn)
+	if !ok {
+		return nil, ErrDnnNotFound
+	}
+	return slice.(*Slice).sessions.GetNextDownlinkFteid(ueCtrl, ueAddr)
+}
+
 func (smf *Smf) UpdateSessionDownlink(ueCtrl jsonapi.ControlURI, ueAddr netip.Addr, dnn string, oldGnbCtrl jsonapi.ControlURI) error {
 	return smf.UpdateSessionDownlinkContext(smf.ctx, ueCtrl, ueAddr, dnn, oldGnbCtrl)
 }
@@ -320,7 +410,7 @@ func (smf *Smf) UpdateSessionDownlinkContext(ctx context.Context, ueCtrl jsonapi
 		return err
 	}
 
-	area, ok := smf.areas.Area(oldGnbCtrl)
+	area, ok := smf.Areas.Area(oldGnbCtrl)
 	if !ok {
 		return ErrAreaNotFound
 	}
